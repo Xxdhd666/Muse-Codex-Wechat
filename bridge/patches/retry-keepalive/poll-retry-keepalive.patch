@@ -1,0 +1,281 @@
+--- a/wechat-ilink-poll.sh
++++ b/wechat-ilink-poll.sh
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env bash
+ set -euo pipefail
+ umask 077
+-if [[ "${1:-}" != --backup-recover && "${1:-}" != --backup-keepalive && "${1:-}" != --backup-probe ]]; then
++if [[ "${1:-}" != --backup-recover && "${1:-}" != --backup-keepalive && "${1:-}" != --backup-probe && "${1:-}" != --keepalive-worker ]]; then
+   source "$HATCH_HOOK_RUNTIME"
+ fi
+ 
+@@ -24,7 +24,7 @@
+ fi
+ 
+ # An override is one executable path (not a shell command). Default unchanged.
+-bridge() {
++bridge_unbounded() {
+   if [ -n "${WX_BRIDGE_CLI:-}" ]; then
+     "$WX_BRIDGE_CLI" "$@"
+   else
+@@ -32,12 +32,72 @@
+   fi
+ }
+ 
++# New structure is opt-in. A single worker owns each complete budget; children
++# remain in that worker's process group so timeout cannot strand a sender.
++bounded_worker() {
++  python3 - "$WX_STATE_DIR" "$1" "$2" "${BASH_SOURCE[0]}" <<'PYBUDGET'
++import fcntl, json, os, signal, subprocess, sys
++state, mode, budget, script = sys.argv[1:]
++lock = None
++if mode == '--keepalive-worker':
++    lock = os.open(os.path.join(state, '.codex-keepalive.mutex'),
++                   os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
++    try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
++    except BlockingIOError: sys.exit(75)
++env = os.environ.copy()
++env['WX_BUDGET_WORKER'] = mode
++# Keep mutex in the worker and its helpers, even if this supervisor dies.
++p = subprocess.Popen(['bash', script, mode], env=env, start_new_session=True,
++                     pass_fds=(() if lock is None else (lock,)))
++try:
++    rc = p.wait(timeout=float(budget))
++except subprocess.TimeoutExpired:
++    os.killpg(p.pid, signal.SIGKILL)
++    p.wait()
++    # The supervised child is now dead, including send descendants. Release
++    # only its own lease via the UNCHANGED PYLOCK release protocol; never clear
++    # a foreign owner or weaken stale-lock age/boot evidence.
++    if mode == '--wechat-budget-worker':
++        try:
++            owner = json.load(open(os.path.join(state, '.outbox.lock', 'owner.json')))
++            if owner['pid'] == p.pid and owner['script'] == os.path.realpath(script):
++                source = open(script).read()
++                program = source.split("<<'PYLOCK'\n", 1)[1].split('\nPYLOCK\n', 1)[0]
++                subprocess.run(['python3', '-c', program, state,
++                    os.environ.get('WX_LOCK_PROC_DIR', '/proc'), str(p.pid), script,
++                    'release', owner['token']], timeout=2, stdout=subprocess.DEVNULL)
++        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
++            pass  # leave foreign/uncertain leases to the existing recovery rules
++    rc = 124
++sys.exit(rc if 0 <= rc <= 255 else 125)
++PYBUDGET
++}
++bridge() {
++  if [ "${WX_BUDGET_WORKER:-}" != --wechat-budget-worker ]; then
++    bridge_unbounded "$@"
++    return
++  fi
++  # Per-duty deadline, nested inside the 65-second total WeChat budget.
++  local remaining=$((DUTY_END - SECONDS))
++  [ "$remaining" -gt 0 ] || return 124
++  if [ -n "${WX_BRIDGE_CLI:-}" ]; then
++    timeout --foreground --signal=KILL "${remaining}s" "$WX_BRIDGE_CLI" "$@"
++  else
++    timeout --foreground --signal=KILL "${remaining}s" node "$BRIDGE_DIR/src/cli/index.js" "$@"
++  fi
++}
++
+ # Shared JSON/file operations. Callers hold .outbox.lock through the whole poll,
+ # including watchdog decisions and fetch. Queue writes go through bridge account transactions.
+ state_op() {
+   python3 - "$WX_STATE_DIR" "$@" <<'PY'
+-import hashlib, json, math, os, sys, tempfile, time
++import fcntl, hashlib, json, math, os, subprocess, sys, tempfile, time
+ state, op, *args = sys.argv[1:]
++# Both keepalive lines and all poll state operations reuse the stable directory
++# guard for read/modify/rename. Never hold it across probe/launch or poll_lock.
++if os.path.isfile(os.path.join(state, 'keepalive-decoupled.enabled')):
++    guard = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
++    fcntl.flock(guard, fcntl.LOCK_EX)
+ now = time.time()
+ lpath = os.path.join(state, '.sent-ledger.json')
+ 
+@@ -106,7 +166,7 @@
+     data[hashlib.sha256(args[0].encode()).hexdigest()] = int(now)
+     atomic(lpath, data)
+ elif op == 'send_result':
+-    result = 'failed'
++    result = 'unknown' if os.path.isfile(os.path.join(state, 'segmented-retry.enabled')) else 'failed'
+     try:
+         data = read_json(args[0])
+         # Only result fields, never recursive search into error.details.
+@@ -115,6 +175,11 @@
+         d = data.get('data', data)
+         if not isinstance(d, dict):
+             raise ValueError('invalid result')
++        if 'deliveryStatus' in d:
++            helper = os.path.join(os.path.expanduser('~'), 'workspace', 'custom-connectors',
++                                  'wechat-ilink-bridge', 'scripts', 'classify-send-result.py')
++            print(subprocess.check_output(['python3', helper, args[0]], text=True).strip())
++            sys.exit(0)
+         # sendText success has chunkCount/sent, without a delivered field.
+         # Queue ownership takes precedence even if sent fields are present.
+         if d.get('voided') is True:
+@@ -258,7 +323,8 @@
+         document = queue()
+         receipts = document.get('voids', {})
+         stuck.extend(entry(it) for it in document['items']
+-                     if not receipts.get(entry(it)['id'], {}).get('reportedAt'))
++                     if not receipts.get(entry(it)['id'], {}).get('reportedAt')
++                     and it.get('segmented', {}).get('deliveryStatus') not in ('partial', 'unknown', 'delivered'))
+     except (OSError, ValueError, TypeError):
+         receipts = {}
+         queue_error = True
+@@ -306,11 +372,13 @@
+ import os, signal, subprocess, sys
+ try:
+     p = subprocess.Popen(sys.argv[1:], stdout=subprocess.DEVNULL,
+-                         stderr=subprocess.DEVNULL, start_new_session=True)
++                         stderr=subprocess.DEVNULL,
++                         start_new_session=os.environ.get("WX_BUDGET_WORKER") != "--keepalive-worker")
+     try:
+         rc = p.wait(timeout=20)
+     except subprocess.TimeoutExpired:
+-        os.killpg(p.pid, signal.SIGKILL)
++        if os.environ.get("WX_BUDGET_WORKER") == "--keepalive-worker": p.kill()
++        else: os.killpg(p.pid, signal.SIGKILL)
+         p.wait()
+         rc = 124
+ except OSError:
+@@ -619,6 +687,32 @@
+   poll_lock recover
+   exit $?
+ fi
++if [[ "${1:-}" = --keepalive-worker || "${1:-}" = --wechat-budget-worker ]]; then
++  [ "${WX_BUDGET_WORKER:-}" = "$1" ] || exit 125
++fi
++if [ "${1:-}" = --keepalive-worker ]; then
++  log() { printf 'HATCH_HOOK_LOG:{"message":"%s","data":%s}\n' "$1" "$2" >&2; }
++  codex_keepalive
++  exit 0
++fi
++# Run BEFORE acquiring the sending owner. No bridge call or receive loop is
++# introduced here. The backup entry uses exactly this same mutex and cooldown.
++if [ -f "$WX_STATE_DIR/keepalive-decoupled.enabled" ] && [ "${1:-}" != --wechat-budget-worker ]; then
++  mkdir -p -m 700 "$WX_STATE_DIR"
++  if [ "${1:-}" = --backup-keepalive ]; then
++    log() { printf '%s %s\n' "$1" "$2"; }
++  fi
++  KEEPALIVE_RC=0
++  bounded_worker --keepalive-worker 15 || KEEPALIVE_RC=$?
++  log "keepalive_slot" "{\"rc\":$KEEPALIVE_RC,\"budget_seconds\":15}"
++  if [ "${1:-}" = --backup-keepalive ]; then exit "$KEEPALIVE_RC"; fi
++  WECHAT_RC=0
++  bounded_worker --wechat-budget-worker 65 || WECHAT_RC=$?
++  if [ "$WECHAT_RC" -ne 0 ]; then
++    silent "wechat_budget_exhausted" "{\"rc\":$WECHAT_RC,\"budget_seconds\":65}"
++  fi
++  exit 0
++fi
+ if [ "${1:-}" = --backup-keepalive ]; then
+   # A valid poll owner excludes the first line while reserving the SAME 600s
+   # cooldown. This also gives .codex-remote.json a single writer at a time.
+@@ -705,6 +799,7 @@
+   fi
+ }
+ 
++DUTY_END=$((SECONDS + 3))
+ if bridge queue prune --account "$ACCOUNT_ALIAS" --json >"$QUEUE_OUT"; then
+   QUEUE_MAINTENANCE="$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d.get("ok") is True; print(json.dumps(d["data"]))' "$QUEUE_OUT")"
+ else
+@@ -715,9 +810,15 @@
+ log "sync_queue_check" "$MAINTENANCE"
+ 
+ # --- Outbox flush -------------------------------------------------------
++DUTY_END=$((SECONDS + 8))
++OUTBOX_CONFIRMATION=''
+ if [ -d "$OUTBOX_DIR" ]; then
+   for f in "$OUTBOX_DIR"/*.txt; do
+     [ -f "$f" ] || continue
++    if [ "${WX_BUDGET_WORKER:-}" = --wechat-budget-worker ] && [ "$SECONDS" -ge "$DUTY_END" ]; then
++      log "outbox_budget_exhausted" '{}'
++      break
++    fi
+     # read preserves trailing newlines, unlike $(cat ...); hash exactly CLI text.
+     TEXT=''
+     IFS= read -r -d '' TEXT < "$f" || true
+@@ -745,8 +846,12 @@
+     SEND_RESULT=failed
+     if [ "$ACTION" = send ]; then
+       SEND_OUT="$(mktemp "$WX_STATE_DIR/.poll-send-XXXXXX")"
+-      if bridge send --user "$OWNER_ID" --text "$TEXT" --json >"$SEND_OUT" 2>/dev/null; then
++      if bridge send --user "$OWNER_ID" --text "$TEXT" --delivery-id "outbox:${f##*/}" --json >"$SEND_OUT" 2>/dev/null; then
+         SEND_RESULT="$(state_op send_result "$SEND_OUT")"
++      elif [ -f "$WX_STATE_DIR/segmented-retry.enabled" ]; then
++        # Killed/invalid responses may follow a successful dispatch. Retain the
++        # source and let the journal fence it; never move it to full-text retry.
++        SEND_RESULT=unknown
+       fi
+       account_lock_diagnostic "$SEND_OUT"
+     else
+@@ -761,6 +866,27 @@
+       voided)
+         rm -f "$f" "$f.attempts"
+         log "outbox_voided" "$FILE_JSON" ;;
++      partial|unknown)
++        if [ "$SEND_RESULT" = unknown ]; then
++          OUTBOX_CONFIRMATION="$(python3 - "$SEND_OUT" "${f##*/}" <<'PYCONFIRM'
++import json, sys
++result = {'file': sys.argv[2], 'deliveryStatus': 'unknown',
++          'reportProtocol': '仅在主对话报告，不重发、不写 outbox。实际报告且取得 deliveryId 后，调用 queue send-report-ack --account <accountId> --ids <deliveryId 的 JSON 数组>；只确认报告，不解除暂停。响应缺失时先用 queue send-reports 核对。'}
++try:
++    data = json.load(open(sys.argv[1])).get('data', {})
++    if data.get('reportAcknowledged') is True: sys.exit(0)
++    for key in ('accountId', 'deliveryId', 'confirmedChunks', 'unknownChunks', 'pendingChunks', 'reason'):
++        if key in data: result[key] = data[key]
++except (OSError, ValueError, TypeError, AttributeError):
++    result['reason'] = 'SEND_RESULT_UNAVAILABLE_CHECK_JOURNAL'
++print(json.dumps(result, ensure_ascii=False))
++PYCONFIRM
++)"
++        fi
++        log "outbox_${SEND_RESULT}" "$FILE_JSON"
++        # Keep the only source. The bridge journal decides continuation/pause;
++        # do not increment legacy attempts or park/recreate the whole message.
++        ;;
+       queued)
+         rm -f "$f" "$f.attempts"
+         log "outbox_queued_not_sent" "$FILE_JSON" ;;
+@@ -779,6 +905,7 @@
+   done
+ fi
+ 
++DUTY_END=$((SECONDS + 2))
+ # Low-frequency automatic retention; bridge cleanup takes the account lock.
+ if [ "$(state_op cleanup_due)" = TRY ]; then
+   if bridge cleanup --account "$ACCOUNT_ALIAS" --message-retention-days 30 --attachment-retention-days 30 --max-history-messages 10000 --json >"$QUEUE_OUT" 2>/dev/null; then
+@@ -790,8 +917,22 @@
+ fi
+ 
+ # --- Codex keepalive: runs even when the sync watchdog will wake. --------
+-codex_keepalive
+-
++if [ "${WX_BUDGET_WORKER:-}" != --wechat-budget-worker ]; then codex_keepalive; fi
++
++DUTY_END=$((SECONDS + 5))
++if [ -n "$OUTBOX_CONFIRMATION" ]; then
++  finish_wake "wechat_delivery_confirmation_required" "$OUTBOX_CONFIRMATION"
++  exit 0
++fi
++# Paused segment evidence is a separate read-only report, never a void request.
++# Leave the journal intact so a wake lost before delivery is safely replayable.
++if { [ -f "$WX_STATE_DIR/segmented-retry.enabled" ] || [ -f "$WX_STATE_DIR/accounts/${ACCOUNT_ALIAS}.segmented-send.ledger" ]; } && bridge queue send-reports --account "$ACCOUNT_ALIAS" --json >"$QUEUE_OUT"; then
++  SEGMENT_REPORT="$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["data"]))' "$QUEUE_OUT")"
++  if python3 -c 'import json,sys; sys.exit(0 if json.loads(sys.argv[1]).get("items") else 1)' "$SEGMENT_REPORT"; then
++    finish_wake "wechat_delivery_confirmation_required" "$SEGMENT_REPORT"
++    exit 0
++  fi
++fi
+ # --- Sync self-check (watchdog) -----------------------------------------
+ PENDING_REPORTS='{"items":[]}'
+ SYNC_SCAN_OK=1
+@@ -850,6 +991,7 @@
+ fi
+ 
+ # --- Fetch: retain original wake/silent behavior and priority ------------
++DUTY_END=$((SECONDS + 42))
+ OUT_FILE="$(mktemp "$WX_STATE_DIR/.poll-fetch-XXXXXX")"
+ ERR_FILE="$(mktemp "$WX_STATE_DIR/.poll-error-XXXXXX")"
+ RC=0

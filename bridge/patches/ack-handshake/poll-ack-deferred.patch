@@ -1,0 +1,50 @@
+--- a/wechat-ilink-poll.sh
++++ b/wechat-ilink-poll.sh
+@@ -853,7 +853,17 @@
+ OUT_FILE="$(mktemp "$WX_STATE_DIR/.poll-fetch-XXXXXX")"
+ ERR_FILE="$(mktemp "$WX_STATE_DIR/.poll-error-XXXXXX")"
+ RC=0
+-bridge fetch --handoff --owner "$OWNER_ID" --timeout 40000 --max-attempts 1 --download-media --json >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
++# Deferred ack is opt-in: after installing the receiver prompt, create the
++# empty regular file "$WX_STATE_DIR/inbound-defer-ack.enabled". Absent = off.
++# Snapshot once per poll so fetch and ack use the same mode. To disable after
++# activation, pause/drain the hook and inbox requeue BEFORE removing the file.
++INBOUND_DEFER_ACK=0
++FETCH_ACK_ARGS=()
++if [ -f "$WX_STATE_DIR/inbound-defer-ack.enabled" ]; then
++  INBOUND_DEFER_ACK=1
++  FETCH_ACK_ARGS+=(--defer-ack)
++fi
++bridge fetch --handoff --owner "$OWNER_ID" --timeout 40000 --max-attempts 1 --download-media "${FETCH_ACK_ARGS[@]}" --json >"$OUT_FILE" 2>"$ERR_FILE" || RC=$?
+ if [ "$RC" -ne 0 ]; then
+   log "fetch_failed" "{\"rc\":$RC}"
+   account_lock_diagnostic "$OUT_FILE" "$ERR_FILE"
+@@ -957,14 +967,22 @@
+ log "duty_success" '{"duty":"fetch"}'
+ log "poll" "{\"newMessageCount\":$COUNT}"
+ if [ "$COUNT" -gt 0 ]; then
+-  # wake may call exit internally: isolate it so a successful local handoff
+-  # can be acknowledged afterwards. No acknowledgement on error or process death.
++  # Fail closed if an older bridge ignored --defer-ack. Never run the legacy
++  # consumer under the assumption that the receiver protocol is installed.
++  if [ "$INBOUND_DEFER_ACK" = "1" ] && ! printf '%s' "$RESULT" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("handoff",{}).get("ackMode") == "receiver" else 1)'; then
++    finish_silent "inbound_receiver_required" '{}'
++    exit 0
++  fi
++  # wake exits internally. Only legacy mode acknowledges local output success;
++  # deferred mode leaves ack to inbox receive after durable receiver acceptance.
+   TERMINAL=1
+   if ( wake "new_wechat_message" "$RESULT" ); then
+-    HANDOFF_IDS="$(printf '%s' "$RESULT" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("handoff",{}).get("ids",[])))')"
+-    if [ "$HANDOFF_IDS" != '[]' ]; then
+-      if ! bridge inbox ack --account "$ACCOUNT_ALIAS" --ids "$HANDOFF_IDS" --json >"$QUEUE_OUT"; then
+-        log "inbound_ack_failed" '{}'
++    if [ "$INBOUND_DEFER_ACK" != "1" ]; then
++      HANDOFF_IDS="$(printf '%s' "$RESULT" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin).get("handoff",{}).get("ids",[])))')"
++      if [ "$HANDOFF_IDS" != '[]' ]; then
++        if ! bridge inbox ack --account "$ACCOUNT_ALIAS" --ids "$HANDOFF_IDS" --json >"$QUEUE_OUT"; then
++          log "inbound_ack_failed" '{}'
++        fi
+       fi
+     fi
+   else

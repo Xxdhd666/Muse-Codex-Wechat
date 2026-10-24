@@ -1,0 +1,456 @@
+--- a/src/state/inbound-handoff-store.js
++++ b/src/state/inbound-handoff-store.js
+@@ -2,6 +2,8 @@
+ import { readJsonFile, writeJsonAtomic } from "./json-file.js";
+ import { withAccountLock } from "./lock.js";
+ import { WxbError } from "../core/errors.js";
++import { open } from "node:fs/promises";
++import path from "node:path";
+ 
+ export function handoffFilePath(stateDir, accountId) {
+   return accountStatePath(stateDir, accountId, ".inbound-handoff.json");
+@@ -41,3 +43,27 @@
+     return { acknowledged: doc.pending.length - pending.length };
+   });
+ }
++
++// Used only by the explicitly enabled receiver protocol. Legacy fetch/ack do
++// not create receiver state or change their output/schema.
++export function receiverState(doc, ownerUserId) {
++  const receiver = doc.receiver ?? { version: 1, ownerUserId, pending: [], processedIds: [] };
++  if (receiver.version !== 1 || receiver.ownerUserId !== ownerUserId ||
++      !Array.isArray(receiver.pending) || !Array.isArray(receiver.processedIds) ||
++      !receiver.processedIds.every(id => typeof id === "string" && id) ||
++      !receiver.pending.every(m => m && typeof m.id === "string" && m.id && m.fromUserId === ownerUserId) ||
++      new Set(receiver.pending.map(m => m.id)).size !== receiver.pending.length ||
++      receiver.pending.some(m => receiver.processedIds.includes(m.id))) {
++    throw new WxbError("STATE_JSON_INVALID", "Invalid inbound receiver state or owner", { retryable: false });
++  }
++  return receiver;
++}
++
++// Call with the account lock held. Sync the directory as well as the JSON
++// contents before allowing ack to remove the poller's durable pending copy.
++export async function writeReceiverHandoff(stateDir, accountId, doc) {
++  const file = handoffFilePath(stateDir, accountId);
++  await writeJsonAtomic(file, doc);
++  const directory = await open(path.dirname(file), "r");
++  try { await directory.sync(); } finally { await directory.close(); }
++}
+--- /dev/null
++++ b/src/core/inbound-receiver.js
+@@ -0,0 +1,79 @@
++import { acknowledgeHandoff, readHandoff, receiverState, writeReceiverHandoff } from "../state/inbound-handoff-store.js";
++import { withAccountLock } from "../state/lock.js";
++
++function validate({ stateDir, accountId, ownerUserId, ids }, requireIds = true) {
++  if (!stateDir || typeof accountId !== "string" || !/^[a-zA-Z0-9._@-]+$/.test(accountId) ||
++      typeof ownerUserId !== "string" || !ownerUserId || (requireIds && (!Array.isArray(ids) ||
++      !ids.length || !ids.every(id => typeof id === "string" && id) || new Set(ids).size !== ids.length))) {
++    throw new TypeError("Receiver requires stateDir, accountId, ownerUserId and unique non-empty string IDs");
++  }
++}
++
++// This is the existing hook consumer's local acceptance boundary, not another
++// fetcher. Copy trusted staged messages, never caller-supplied message bodies.
++export async function receiveInbound(options = {}) {
++  validate(options);
++  const { stateDir, accountId, ownerUserId, ids } = options;
++  const result = await withAccountLock(stateDir, accountId, async () => {
++    const doc = await readHandoff(stateDir, accountId);
++    const receiver = receiverState(doc, ownerUserId);
++    const processed = new Set(receiver.processedIds);
++    const staged = new Map(doc.pending.map(m => [m.id, m]));
++    const pending = new Map(receiver.pending.map(m => [m.id, m]));
++    // Validate the entire batch before changing anything; IDs are exact and
++    // account-scoped. Equal text/timestamps on different IDs are independent.
++    for (const id of ids) {
++      const source = staged.get(id) ?? pending.get(id);
++      if (source && source.fromUserId !== ownerUserId) throw new TypeError("Inbound receiver owner mismatch");
++      if (!source && !processed.has(id)) throw new TypeError("Unknown inbound message ID");
++      if (!processed.has(id)) pending.set(id, source);
++    }
++    receiver.pending = [...pending.values()];
++    await writeReceiverHandoff(stateDir, accountId, { ...doc, receiver });
++    return { accountId, messages: ids.filter(id => !processed.has(id)).map(id => pending.get(id)),
++      duplicateCount: ids.filter(id => processed.has(id)).length };
++  });
++  // Deliberately outside the first lock: call the existing inbox ack primitive
++  // only AFTER receiver work is durable. Failure leaves resumable work.
++  await acknowledgeHandoff(stateDir, accountId, ids);
++  return result;
++}
++
++// Invoke only after this ID's business handling has completed. An unfinished
++// record is replayable; acceptance alone must never mark an ID as processed.
++export async function completeInbound(options = {}) {
++  validate(options);
++  const { stateDir, accountId, ownerUserId, ids } = options;
++  return withAccountLock(stateDir, accountId, async () => {
++    const doc = await readHandoff(stateDir, accountId);
++    const receiver = receiverState(doc, ownerUserId);
++    const processed = new Set(receiver.processedIds);
++    const pending = new Set(receiver.pending.map(m => m.id));
++    for (const id of ids) {
++      if (!pending.has(id) && !processed.has(id)) throw new TypeError("Inbound message was not received");
++      processed.add(id);
++    }
++    const done = new Set(ids);
++    receiver.pending = receiver.pending.filter(m => !done.has(m.id));
++    receiver.processedIds = [...processed];
++    await writeReceiverHandoff(stateDir, accountId, { ...doc, receiver });
++    return { completed: ids.length };
++  });
++}
++
++// Operator-only rollback, with the hook paused and active workers drained.
++// Preserve both ID ledgers and return unfinished accepted work to legacy fetch.
++export async function requeueInbound(options = {}) {
++  validate(options, false);
++  const { stateDir, accountId, ownerUserId } = options;
++  return withAccountLock(stateDir, accountId, async () => {
++    const doc = await readHandoff(stateDir, accountId);
++    const receiver = receiverState(doc, ownerUserId);
++    const pending = new Map(doc.pending.map(m => [m.id, m]));
++    for (const message of receiver.pending) pending.set(message.id, message);
++    const requeued = receiver.pending.length;
++    receiver.pending = [];
++    await writeReceiverHandoff(stateDir, accountId, { ...doc, pending: [...pending.values()], receiver });
++    return { requeued };
++  });
++}
+--- a/src/cli/commands/inbox.js
++++ b/src/cli/commands/inbox.js
+@@ -1,10 +1,19 @@
+ import { parseCliArgs } from "../../config/load-config.js";
+ import { cliSuccess } from "../../core/errors.js";
+ import { acknowledgeHandoff } from "../../state/inbound-handoff-store.js";
++import { receiveInbound, completeInbound, requeueInbound } from "../../core/inbound-receiver.js";
+ 
+ export async function runInboxCommand(argv, context) {
+   const [subcommand, ...rest] = argv;
+   const flags = parseCliArgs(rest);
++  if (subcommand === "requeue") {
++    return cliSuccess(await requeueInbound({ stateDir: context.config.stateDir, accountId: flags.account, ownerUserId: flags.owner }));
++  }
++  if (subcommand === "receive" || subcommand === "complete") {
++    const operation = subcommand === "receive" ? receiveInbound : completeInbound;
++    return cliSuccess(await operation({ stateDir: context.config.stateDir, accountId: flags.account,
++      ownerUserId: flags.owner, ids: JSON.parse(flags.ids) }));
++  }
+   if (subcommand !== "ack" || typeof flags.account !== "string") throw new TypeError("Use inbox ack --account <id> --ids <JSON array>");
+   return cliSuccess(await acknowledgeHandoff(context.config.stateDir, flags.account, JSON.parse(flags.ids)));
+ }
+--- a/src/core/fetch-messages.js
++++ b/src/core/fetch-messages.js
+@@ -1,4 +1,4 @@
+-import { readHandoff, stageHandoff } from "../state/inbound-handoff-store.js";
++import { readHandoff, stageHandoff, receiverState } from "../state/inbound-handoff-store.js";
+ import { createHash } from "node:crypto";
+ import { WxbError } from "./errors.js";
+ import { IlinkClient } from "./ilink-client.js";
+@@ -116,6 +116,7 @@
+     retry = {},
+     downloadMedia = false,
+     handoff = false,
++    deferAck = false,
+     ownerUserId,
+     mediaFetchImpl
+   } = options;
+@@ -127,6 +128,7 @@
+   if (handoff && (typeof ownerUserId !== "string" || !ownerUserId)) {
+     throw new TypeError("Reliable handoff requires --owner from the poller owner configuration");
+   }
++  if (deferAck && !handoff) throw new TypeError("Deferred ack requires --handoff");
+   const account = await resolveFetchAccount(stateDir, accountId);
+   const client = providedClient ?? new IlinkClient({
+     baseUrl: account.baseUrl ?? config.baseUrl,
+@@ -135,12 +137,16 @@
+ 
+   return withAccountLock(stateDir, account.accountId, async () => {
+     const inbox = handoff ? await readHandoff(stateDir, account.accountId) : null;
+-    const handoffInfo = messages => ({ accountId: account.accountId, ids: messages.map(m => m.id) });
++    const handoffInfo = messages => ({ accountId: account.accountId, ids: messages.map(m => m.id),
++      ...(deferAck ? { ackMode: "receiver" } : {}) });
++    const replay = deferAck
++      ? [...new Map([...inbox.pending, ...receiverState(inbox, ownerUserId).pending].map(m => [m.id, m])).values()]
++      : inbox?.pending;
+     // Replay local unacknowledged work before any network/flush side effect.
+-    if (inbox?.pending.length) {
+-      if (inbox.pending.some(m => m.fromUserId !== ownerUserId)) throw new TypeError("Pending inbox owner mismatch");
+-      return { accountId: account.accountId, messages: inbox.pending, newMessageCount: inbox.pending.length,
+-        rawMessageCount: 0, attempts: 0, delayedDeliveries: [], handoff: handoffInfo(inbox.pending), replayed: true };
++    if (replay?.length) {
++      if (replay.some(m => m.fromUserId !== ownerUserId)) throw new TypeError("Pending inbox owner mismatch");
++      return { accountId: account.accountId, messages: replay, newMessageCount: replay.length,
++        rawMessageCount: 0, attempts: 0, delayedDeliveries: [], handoff: handoffInfo(replay), replayed: true };
+     }
+     const previousBuffer = await readSyncBuffer(stateDir, account.accountId);
+     const { response, attempts } = await getUpdatesWithRetry(client, {
+--- a/src/cli/commands/fetch.js
++++ b/src/cli/commands/fetch.js
+@@ -44,6 +44,7 @@
+     stderr: context.stderr,
+     downloadMedia: flags.downloadMedia === true || flags.media === true,
+     handoff: flags.handoff === true,
++    deferAck: flags.deferAck === true,
+     ownerUserId: flags.owner,
+     mediaFetchImpl: context.mediaFetchImpl
+   });
+--- a/src/core/cleanup.js
++++ b/src/core/cleanup.js
+@@ -141,8 +141,9 @@
+   for (const account of selectedAccounts) {
+     await withAccountLock(stateDir, account.accountId, async () => {
+       const inbox = await readHandoff(stateDir, account.accountId);
+-      const protectedIds = new Set(inbox.pending.map(m => m.id));
+-      const protectedPaths = new Set(inbox.pending.flatMap(m => (m.attachments ?? []).map(a => a.path)));
++      const pending = [...inbox.pending, ...(inbox.receiver?.pending ?? [])];
++      const protectedIds = new Set(pending.map(m => m.id));
++      const protectedPaths = new Set(pending.flatMap(m => (m.attachments ?? []).map(a => a.path)));
+       const history = await readMessageHistory(stateDir, account.accountId);
+       const pruned = pruneHistory(history.filter(m => !protectedIds.has(m.id)), {
+         nowMs,
+--- /dev/null
++++ b/test/unit/inbound-receiver.test.js
+@@ -0,0 +1,218 @@
++import assert from "node:assert/strict";
++import { execFile } from "node:child_process";
++import { promisify } from "node:util";
++import fs from "node:fs/promises";
++import { syncBuiltinESMExports } from "node:module";
++import os from "node:os";
++import path from "node:path";
++import test, { mock } from "node:test";
++import { receiveInbound, completeInbound, requeueInbound } from "../../src/core/inbound-receiver.js";
++import { fetchMessages } from "../../src/core/fetch-messages.js";
++import { cleanupState } from "../../src/core/cleanup.js";
++import { runFetchCommand } from "../../src/cli/commands/fetch.js";
++import { runInboxCommand } from "../../src/cli/commands/inbox.js";
++import { saveAccount } from "../../src/state/account-store.js";
++import { appendMessageHistory } from "../../src/state/message-history.js";
++import { readHandoff, stageHandoff, handoffFilePath } from "../../src/state/inbound-handoff-store.js";
++
++const exec = promisify(execFile);
++const accountId = "fixture_bot", ownerUserId = "fixture_owner";
++const message = id => ({ id, fromUserId: ownerUserId, type: "text", text: "相同正文", timestamp: 1 });
++async function fixture(callback) {
++  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "wxb-receiver-"));
++  const options = { stateDir, accountId, ownerUserId };
++  try { await callback(options); } finally { await fs.rm(stateDir, { recursive: true, force: true }); }
++}
++async function seed(options, ids = ["m1"]) {
++  await saveAccount(options.stateDir, { accountId, token: "synthetic-fixture-only", baseUrl: "https://mock.invalid" });
++  await stageHandoff(options.stateDir, accountId, ids.map(message));
++}
++function offlineFetch(options) {
++  return fetchMessages({ ...options, handoff: true, deferAck: true,
++    client: { getUpdates() { throw new Error("Pending replay must not call network"); } } });
++}
++
++test("receiver persists exact processed IDs across a fresh CLI process and discards duplicate wakes", async () => {
++  await fixture(async options => {
++    await seed(options, ["m1", "m10"]);
++    const first = await receiveInbound({ ...options, ids: ["m1"] });
++    assert.deepEqual(first.messages, [message("m1")]);
++    assert.equal(first.duplicateCount, 0);
++    await completeInbound({ ...options, ids: ["m1"] });
++    const { stdout } = await exec(process.execPath, [path.resolve("src/cli/index.js"),
++      "inbox", "receive", "--account", accountId, "--owner", ownerUserId,
++      "--ids", '["m1","m10"]', "--state-dir", options.stateDir, "--json"], { cwd: options.stateDir });
++    const result = JSON.parse(stdout);
++    assert.equal(result.ok, true);
++    assert.equal(result.data.duplicateCount, 1);
++    assert.deepEqual(result.data.messages, [message("m10")]);
++    const doc = await readHandoff(options.stateDir, accountId);
++    assert.deepEqual(doc.receiver.processedIds, ["m1"]);
++    assert.deepEqual(doc.receiver.pending, [message("m10")]);
++    assert.deepEqual(doc.acceptedIds, ["m1", "m10"]);
++    assert.deepEqual(doc.pending, []);
++    const file = await fs.stat(handoffFilePath(options.stateDir, accountId));
++    assert.equal(file.mode & 0o777, 0o600);
++  });
++});
++
++test("wake without ack is replayed next fetch; acceptedIds alone never suppress pending", async () => {
++  await fixture(async options => {
++    await seed(options);
++    const wake = await offlineFetch(options);
++    // Simulate loss of the worker after wake output, before inbox receive/ack.
++    const next = await offlineFetch(options);
++    assert.deepEqual(next, wake);
++    assert.equal(next.replayed, true);
++    assert.deepEqual(next.handoff, { accountId, ids: ["m1"], ackMode: "receiver" });
++    assert.deepEqual(next.messages, [message("m1")]);
++    assert.deepEqual((await readHandoff(options.stateDir, accountId)).acceptedIds, ["m1"]);
++  });
++});
++
++test("receiver acceptance then ack is recoverable before processing or output; complete ends replay", async () => {
++  await fixture(async options => {
++    await seed(options);
++    await receiveInbound({ ...options, ids: ["m1"] });
++    let doc = await readHandoff(options.stateDir, accountId);
++    assert.deepEqual(doc.pending, []);
++    assert.deepEqual(doc.receiver.processedIds, []);
++    const resumed = await offlineFetch(options);
++    assert.deepEqual(resumed.messages, [message("m1")]);
++    assert.equal(resumed.newMessageCount, 1);
++    assert.deepEqual((await receiveInbound({ ...options, ids: ["m1"] })).messages, [message("m1")]);
++    await completeInbound({ ...options, ids: ["m1"] });
++    const duplicate = await receiveInbound({ ...options, ids: ["m1"] });
++    assert.deepEqual(duplicate.messages, []);
++    assert.equal(duplicate.duplicateCount, 1);
++    doc = await readHandoff(options.stateDir, accountId);
++    assert.deepEqual(doc.receiver.pending, []);
++  });
++});
++
++test("receiver sync failure never acknowledges poll pending", async () => {
++  await fixture(async options => {
++    await seed(options);
++    const original = fs.open;
++    const patch = mock.method(fs, "open", async (file, ...args) => {
++      if (file === path.join(options.stateDir, "accounts")) throw new Error("fixture directory sync failure");
++      return original(file, ...args);
++    });
++    syncBuiltinESMExports();
++    try {
++      await assert.rejects(receiveInbound({ ...options, ids: ["m1"] }), /fixture directory sync failure/);
++      assert.deepEqual((await readHandoff(options.stateDir, accountId)).pending, [message("m1")]);
++    } finally { patch.mock.restore(); syncBuiltinESMExports(); }
++    assert.deepEqual((await receiveInbound({ ...options, ids: ["m1"] })).messages, [message("m1")]);
++  });
++});
++
++test("ack write failure preserves both durable copies and replay merges by exact ID", async () => {
++  await fixture(async options => {
++    await seed(options);
++    let writes = 0;
++    const original = fs.rename;
++    const patch = mock.method(fs, "rename", async (...args) => {
++      if (++writes === 2) throw Object.assign(new Error("fixture ack failure"), { code: "EIO" });
++      return original(...args);
++    });
++    syncBuiltinESMExports();
++    try {
++      await assert.rejects(receiveInbound({ ...options, ids: ["m1"] }), /fixture ack failure/);
++      const doc = await readHandoff(options.stateDir, accountId);
++      assert.deepEqual(doc.pending, [message("m1")]);
++      assert.deepEqual(doc.receiver.pending, [message("m1")]);
++      assert.deepEqual((await offlineFetch(options)).messages, [message("m1")]);
++    } finally { patch.mock.restore(); syncBuiltinESMExports(); }
++    assert.deepEqual((await receiveInbound({ ...options, ids: ["m1"] })).messages, [message("m1")]);
++  });
++});
++
++test("unknown IDs, duplicate input IDs and wrong owners fail closed without ack or state change", async () => {
++  await fixture(async options => {
++    await seed(options);
++    const before = await fs.readFile(handoffFilePath(options.stateDir, accountId));
++    for (const input of [{ ids: ["m"] }, { ids: ["m1", "m1"] }, { ids: ["m1"], ownerUserId: "stranger" }, { ids: [1] }]) {
++      await assert.rejects(receiveInbound({ ...options, ...input }));
++      assert.deepEqual(await fs.readFile(handoffFilePath(options.stateDir, accountId)), before);
++    }
++    await assert.rejects(completeInbound({ ...options, ids: ["m1"] }), /was not received/);
++    assert.deepEqual(await fs.readFile(handoffFilePath(options.stateDir, accountId)), before);
++  });
++});
++
++test("complete is idempotent; account-scoped same ID is independent", async () => {
++  await fixture(async options => {
++    await seed(options);
++    await receiveInbound({ ...options, ids: ["m1"] });
++    await completeInbound({ ...options, ids: ["m1"] });
++    await completeInbound({ ...options, ids: ["m1"] });
++    assert.deepEqual((await readHandoff(options.stateDir, accountId)).receiver.processedIds, ["m1"]);
++    await stageHandoff(options.stateDir, "other_bot", [message("m1")]);
++    assert.deepEqual((await receiveInbound({ ...options, accountId: "other_bot", ids: ["m1"] })).messages, [message("m1")]);
++  });
++});
++
++test("legacy fetch and inbox ack preserve exact envelope, counts, IDs, and immediate ack result", async () => {
++  await fixture(async options => {
++    await seed(options);
++    const context = { config: { stateDir: options.stateDir }, client: { getUpdates() { throw new Error("no network"); } } };
++    const result = await runFetchCommand(["--handoff", "--owner", ownerUserId], context);
++    const expected = { ok: true, data: { accountId, messages: [message("m1")], newMessageCount: 1,
++      rawMessageCount: 0, attempts: 0, delayedDeliveries: [], handoff: { accountId, ids: ["m1"] }, replayed: true } };
++    assert.equal(JSON.stringify(result), JSON.stringify(expected));
++    const ack = await runInboxCommand(["ack", "--account", accountId, "--ids", '["m1"]'], context);
++    assert.equal(JSON.stringify(ack), '{"ok":true,"data":{"acknowledged":1}}');
++    assert.deepEqual(await readHandoff(options.stateDir, accountId), { pending: [], acceptedIds: ["m1"] });
++    assert.deepEqual(await runInboxCommand(["ack", "--account", accountId, "--ids", '["m1"]'], context),
++      { ok: true, data: { acknowledged: 0 } });
++  });
++});
++
++test("deferred ack requires handoff and is enabled only by explicit CLI flag", async () => {
++  await fixture(async options => {
++    await seed(options);
++    await assert.rejects(fetchMessages({ ...options, deferAck: true }), /requires --handoff/);
++    const result = await runFetchCommand(["--handoff", "--defer-ack", "--owner", ownerUserId],
++      { config: { stateDir: options.stateDir } });
++    assert.equal(result.data.handoff.ackMode, "receiver");
++  });
++});
++
++test("rollback requeues unfinished work without erasing processed or accepted IDs", async () => {
++  await fixture(async options => {
++    await seed(options, ["m1", "m2"]);
++    await receiveInbound({ ...options, ids: ["m1", "m2"] });
++    await completeInbound({ ...options, ids: ["m1"] });
++    const result = await runInboxCommand(["requeue", "--account", accountId, "--owner", ownerUserId],
++      { config: { stateDir: options.stateDir } });
++    assert.deepEqual(result, { ok: true, data: { requeued: 1 } });
++    const legacy = await fetchMessages({ ...options, handoff: true });
++    assert.deepEqual(legacy.messages, [message("m2")]);
++    const doc = await readHandoff(options.stateDir, accountId);
++    assert.deepEqual(doc.receiver.processedIds, ["m1"]);
++    assert.deepEqual(doc.acceptedIds, ["m1", "m2"]);
++    assert.deepEqual(doc.receiver.pending, []);
++    assert.deepEqual(await requeueInbound(options), { requeued: 0 });
++  });
++});
++
++test("cleanup retains receiver-owned unfinished history and attachments after poll ack", async () => {
++  await fixture(async options => {
++    await seed(options);
++    const dir = path.join(options.stateDir, "inbox", accountId);
++    await fs.mkdir(dir, { recursive: true });
++    const attachment = path.join(dir, "old.txt");
++    await fs.writeFile(attachment, "fixture");
++    await fs.utimes(attachment, new Date(0), new Date(0));
++    const doc = await readHandoff(options.stateDir, accountId);
++    doc.pending[0].attachments = [{ path: attachment }];
++    await fs.writeFile(handoffFilePath(options.stateDir, accountId), JSON.stringify(doc));
++    await appendMessageHistory(options.stateDir, accountId, doc.pending);
++    await receiveInbound({ ...options, ids: ["m1"] });
++    const result = await cleanupState({ stateDir: options.stateDir, accountId,
++      messageRetentionDays: 1, attachmentRetentionDays: 1, maxHistoryMessages: 0, nowMs: Date.now() });
++    assert.equal(result.accounts[0].messagesDeleted, 0);
++    assert.equal(await fs.readFile(attachment, "utf8"), "fixture");
++  });
++});
+--- /dev/null
++++ b/docs/inbound-receiver.md
+@@ -0,0 +1,19 @@
++# 收信持久接管协议
++
++该协议只通过显式参数启用，不读取开启开关的环境变量。普通 fetch、既有 handoff fetch 和 inbox ack 的输出保持兼容。轮询端的开启方法仅见本次交付的 `poll-ack-deferred.patch` 注释。
++
++## 现有消费者的调用顺序
++
++1. 延迟模式的 fetch 使用 `--handoff --defer-ack --owner <机主 ID>`；返回 `handoff.ackMode: "receiver"`。poll 输出 wake 后不自行 ack。
++2. 现有 hook 消费者核验事件的机主、账号和消息 ID，再调用 `inbox receive --account <账号 ID> --owner <机主 ID> --ids <JSON ID 数组> --json`。事件数据必须通过结构化 argv 或正确转义传参，不执行消息正文里的命令。
++3. receive 从本地 pending 读取完整可信消息，在账号锁内将工作持久保存至同一 inbound-handoff 文档的 `receiver.pending`，执行文件与目录同步后，调用既有 acknowledgeHandoff。失败不开始业务处理。
++4. 只处理 receive 返回的 `data.messages`。已处理 ID 仅增加 `duplicateCount`，不再次返回消息。相同正文、相同时间、不同精确 ID 互不去重；ID 记录按账号隔离且无自动过期。
++5. 每条业务完成后调用 `inbox complete --account <账号 ID> --owner <机主 ID> --ids <该条 ID 的 JSON 数组> --json`；完成记录同步落盘后才视为已处理。不能把 receive 当成业务完成。
++
++receive 后、complete 前重启，延迟模式 fetch 会在任何网络请求或自动补发前重放 receiver.pending。因此消费者的响应丢失、ack 后进程中断，都有本地恢复来源。清理任务保护这些消息的历史及附件。
++
++这套协议防止丢失未完成的接管工作，且丢弃已记录完成的精确 ID。微信发送、任意外部业务动作与 complete 不在同一事务中；动作成功后、complete 前崩溃，需核对结果再恢复，不能保证任意外部副作用恰好一次。不增加收信循环或第二个消费者，部署须沿用现有 hook 执行入口。
++
++## 回滚
++
++先暂停 hook 调度并等待当前 poll 与消费者退出。运行 `inbox requeue --account <账号 ID> --owner <机主 ID> --json` 将未完成的 receiver.pending 原子移回原 pending，再关闭延迟模式并恢复旧 poll 和旧提示词。requeue 保留 acceptedIds 与 processedIds，不能删账本、恢复旧状态快照或清空 pending。若无法暂停和排空消费者，不要并发 requeue；先保持停用并排查。

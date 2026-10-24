@@ -1,0 +1,31 @@
+--- a/daily-huqiu-weather-wechat__daily@07:25:00.md
++++ b/daily-huqiu-weather-wechat__daily@07:25:00.md
+@@ -21,12 +21,20 @@
+ 2. 把天气整理成一条简短的中文微信消息（纯文本，不要堆 Markdown），格式大致为：
+    「早上好，王艺凡。虎丘区今天（X月X日）……，最高…℃，最低…℃，……。一句出门建议（按数据来：比如带伞、添衣、防风）。」
+ 3. 先尝试用微信桥接工具直接发送：
+-   cd ~/workspace/custom-connectors/wechat-ilink-bridge && WX_STATE_DIR="$HOME/workspace/custom-connectors/wechat-ilink/state" node ./src/cli/index.js send --user "OWNER_ID" --text "<上面的天气消息>" --json
++   cd ~/workspace/custom-connectors/wechat-ilink-bridge && WX_STATE_DIR="$HOME/workspace/custom-connectors/wechat-ilink/state" node ./src/cli/index.js send --user "OWNER_ID" --text "<上面的天气消息>" --delivery-id "weather:<当天YYYYMMDD>" --json
+    如果返回 STATE_LOCK_TIMEOUT，隔十几秒重试一次（最多重试一次）。保存并检查退出状态及 JSON 返回，禁止把退出码 0 或 ok:true 单独当作送达。
+-4. 按桥接结果分支，只走一个路径：
+-   - 完整送达：退出码为 0，JSON ok 严格为 true，data.queued 不为 true、data.voided 不为 true，data.chunkCount 是正整数（不是布尔值），data.sent 是数组且长度等于 chunkCount。此时才记录“微信已送达”，不写 outbox。
+-   - 已排队：退出码为 0、ok:true、data.queued 严格为 true。即使同时出现 sent 字段，也按 queued 处理：桥接已接管，记录“已排队待投递”，禁止宣称送达，禁止写 outbox，禁止再次发送或要求用户为旧同步刷新 token。
+-   - 已作废：data.voided 严格为 true 优先于其余分支；只在主对话记录“已作废，未发送”，不重发、不写 outbox、不请用户为旧同步刷新 token。
+-   - 失败：其余失败/无效返回都不得记录送达。通常把尚未送出的天气原文写入 ~/workspace/custom-connectors/wechat-ilink/state/outbox/weather-<当天YYYYMMDD>.txt（只写消息正文，一字不差，目录 0700、文件 0600），然后说明“已入发件箱排队待投递”。同一条消息只保留这一条发送路径，不覆盖同日已有文件来制造重复副本。如果错误明确显示部分或全部已发出（error.details.sentCount > 0、delivered:true 或 deliveredClientIds 非空），禁止把全文再入 outbox；在主对话说明发送不完整/状态待确认及兜底未重发的原因。不要反复重试。
+-   若失败为 SESSION_EXPIRED，另外说明微信会话需要重新扫码登录，排队不代表已送达；这是账号登录恢复，不是要求为已报告作废的旧同步刷新 context token。天气查询或写入 outbox 本身失败也须如实说明原因，不得编造已排队。
+-5. 最后在主对话留一行简短记录：今天日期 + 天气一句话概括 + 微信是已送达、桥接已排队待投递、已入发件箱排队待投递、已作废未发送、还是失败（说明兜底结果）。不要泄露任何 token 或状态文件内容，不把报告再写入 outbox。
++4. 保存发送 JSON 到私有临时文件，并保留发送进程的真实退出码（下列 `<结果文件>` 和 `<退出码>` 都使用结构化 argv 或严格 shell 转义）。用与轮询相同的只读判断器分类：
++
++   ```bash
++   python3 "$HOME/workspace/custom-connectors/wechat-ilink-bridge/scripts/classify-send-result.py" <结果文件> <退出码>
++   ```
++
++   按判断器输出只走一个路径：
++   - delivered：完整送达；记录“微信已送达”，不写 outbox。
++   - queued：桥接已持久接管，记录“已排队待投递”；不宣称送达，不写 outbox、不再次发送、不要求刷新 token。
++   - partial：已有确认分段，剩余分段明确未发送；在主对话报告 deliveryId、confirmedChunks、pendingChunks，禁止把全文再入 outbox。只可由原逻辑消息续发；重试沿用同一个 --delivery-id（若原调用未给 ID，则继续用相同正文及用户，不能临时换 ID 绕过账本）。
++   - unknown：待人工确认；在主对话报告 deliveryId、confirmedChunks、unknownChunks、pendingChunks。即使退出码为 0 或 ok:true 也不能宣称送达；不再发送、不写 outbox。响应文件缺失/损坏/四态字段矛盾也归 unknown；用 queue send-reports --account BOT_ACCOUNT --json 只读查询，不读登录文件。
++   - voided：只在主对话记录“已作废，未发送”，不重发、不写 outbox。
++   - failed：判断器已排除部分发送证据的普通失败，才允许把尚未送出的天气原文写入 ~/workspace/custom-connectors/wechat-ilink/state/outbox/weather-<当天YYYYMMDD>.txt（只写消息正文，一字不差，目录 0700、文件 0600）。同日已有文件不得覆盖或另建副本。写入成功才说“已入发件箱排队待投递”。
++   判断器兼容开关关闭时的旧结构；旧 error.details.sentCount / delivered / deliveredClientIds 只要显示可能已发出，就归 unknown，禁止全文兜底。SESSION_EXPIRED 另外如实说明账号登录会话过期；不在本任务自动登录。报告不得再次写入 outbox。
++5. 最后在主对话留一行简短记录：今天日期 + 天气一句话概括 + 微信是已送达、桥接已排队待投递、已入发件箱排队待投递、已作废未发送、部分成功、状态待确认、还是失败（说明兜底结果）。不要泄露任何 token 或状态文件内容，不把报告再写入 outbox。

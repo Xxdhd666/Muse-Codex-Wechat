@@ -1,0 +1,11 @@
+--- a/watchman-backup-check__interval@30m.md
++++ b/watchman-backup-check__interval@30m.md
+@@ -72,7 +72,7 @@
+ bash "$HOME/hooks/scripts/wechat-ilink-poll.sh" --backup-keepalive
+ ```
+ 
+-此入口先正常取得同一轮询 owner，从而与第一线互斥；若 owner 活着／证据不足，直接拒绝。取锁后重新探活，读取 STATE/.codex-remote.json 的 last_attempt，距上次尝试不足 600 秒不启动；状态损坏时保守等待完整冷却。冷却满足则在启动前持久预约 last_attempt，再使用与第一线相同的 UTS 方法（unshare --uts --fork、hostname Muse、cd HOME、remote-control start），启动超时 20 秒。预约与第一线共享文件及串行化规则，不能自己绕过另起启动命令。记录启动返回码及启动后身份探测；显示名应为 Muse，未知时如实写未知，rc=0 不等于 connected。这个入口不发送、不 fetch。
++当 STATE/keepalive-decoupled.enabled 不存在时，原有行为逐项照旧：此入口先正常取得同一轮询 owner，从而与第一线互斥；若 owner 活着／证据不足，直接拒绝。当该开关存在时，此入口与第一线共用独立的 .codex-keepalive.mutex，不再等待微信发送 owner；只执行本地探活与恢复预约，完整保活槽上限 15 秒，互斥忙返回 75、总预算用尽返回 124，不能据此扩大清锁或启动权限。所有冷却读改写仍在 STATE 目录 inode 的串行 guard 内，继续使用同一 .codex-remote.json 与 600 秒预约。启停此开关前必须暂停两线并排空在跑实例，防止新旧结构交叉。下文“取锁”在开启时指独立保活互斥。取锁后重新探活，读取 STATE/.codex-remote.json 的 last_attempt，距上次尝试不足 600 秒不启动；状态损坏时保守等待完整冷却。冷却满足则在启动前持久预约 last_attempt，再使用与第一线相同的 UTS 方法（unshare --uts --fork、hostname Muse、cd HOME、remote-control start），启动超时 20 秒。预约与第一线共享文件及串行化规则，不能自己绕过另起启动命令。记录启动返回码及启动后身份探测；显示名应为 Muse，未知时如实写未知，rc=0 不等于 connected。这个入口不发送、不 fetch。
+ 
+ 检查三：卡信必须先持久作废，后报告。
+ 

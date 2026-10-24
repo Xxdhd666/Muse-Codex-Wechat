@@ -1,0 +1,543 @@
+--- /dev/null
++++ b/docs/segmented-retry.md
+@@ -0,0 +1,24 @@
++# 可选分段重试
++
++默认关闭：只在 `WX_STATE_DIR/segmented-retry.enabled` 是文件时为新消息建立分段账本。关闭、且消息从未进入账本时，沿用旧发送逻辑和旧返回结构。开启不会改变收信确认协议；旧消费者与延迟确认消费者都调用同一 `sendText`。
++
++调用方为每条逻辑回复提供稳定 ID：CLI `send --delivery-id <逻辑ID>`，MCP `sendText.deliveryId`。同一消息重试沿用 ID 和正文；新的独立消息使用新 ID。未提供 ID 时，按接收者与完整正文识别同一逻辑消息；账本不会自动过期，因此相同正文的独立新回复必须提供不同 ID。禁止用新 ID 绕过待确认项。
++
++结果中的 `deliveryStatus` 为：
++
++| 值 | 含义 | 调用方动作 |
++| --- | --- | --- |
++| delivered | 所有分段都确认并持久记账 | 可以记录完整送达 |
++| queued | 尚无已确认分段，桥接队列已接管 | 不再建立 outbox 副本 |
++| partial | 部分已确认，剩余段明确未发送 | 按原逻辑 ID 续发；禁止全文兜底 |
++| unknown | 存在在途不确定性、记账故障或安全暂停 | 主对话报告，等待人工核对，不自动重发 |
++
++`failed` 和 `voided` 是没有交付四态的辅助结果；`none` / `skipped` 是队列未尝试发送的旧状态。不要把退出码 0 或 `ok:true` 当作送达。旧返回结构兼容期仍保留 `sent`、`chunkCount`；新状态以 `deliveryStatus` 为准。轮询与天气共用 `scripts/classify-send-result.py <结果文件> [真实退出码]`。判断器不加载账号，也不联网。
++
++账本位于 `accounts/<安全账号ID>.segmented-send.ledger`，内容为 JSON，权限 0600。后缀刻意不使用 `.json`，避免现有账号扫描器把账本当成登录文件。所有读改写使用既有账号事务锁；原子替换后同步父目录。账本只保存正文分段、客户端 ID、状态与报告凭据，不保存认证或路由字段。
++
++发送顺序为：分段 `pending → inflight` 落盘并同步 → 单次网络发送 → 原有历史写入 → `confirmed` 落盘并同步。重试跳过 confirmed。只有明确的 INVALID_CONTEXT_TOKEN、SESSION_EXPIRED、AUTH_FAILED 拒绝才重新标为 pending；网络异常、超时、5xx、响应解析失败和未知异常均保持在途、停止自动发送。历史或进度写入失败返回 unknown；若恢复写入也失败，之前的在途记录仍阻止重发。客户端 ID 稳定，但没有假设服务端提供幂等保证。
++
++`queue send-reports --account <账号ID> --json` 只输出逻辑消息标识、正文哈希和已确认/未知/未发送段序号，不输出正文或敏感路由。主对话实际报告后，调用 `queue send-report-ack --account <账号ID> --ids '<已报告 deliveryId 的 JSON 数组>' --json`。这只抑制重复事实报告，绝不解除暂停。报告请求丢失会重放；报告后、ack 前崩溃可能重复报告事实，仍不会重发微信。
++
++关闭开关只停止新消息进入新机制，并冻结账本中未完成项；已有 confirmed / inflight 保护始终保留。不能删除账本、换 ID、改正文或把部分消息全文写入另一条路径来“回滚”。人工核对后的恢复策略另行审定，本版没有自动清除未知状态的命令。原有作废表始终优先，作废项绝不复活。
+--- /dev/null
++++ b/scripts/classify-send-result.py
+@@ -0,0 +1,44 @@
++#!/usr/bin/env python3
++"""只解析发送结果文件；不加载账号、不联网、不输出正文或凭据。"""
++import json, sys
++
++def classify(envelope, rc=0):
++    if not isinstance(envelope, dict):
++        return 'unknown'
++    d = envelope.get('data')
++    if isinstance(d, dict) and d.get('voided') is True:
++        return 'voided'
++    if isinstance(d, dict) and 'deliveryStatus' in d:
++        status = d['deliveryStatus']
++        if envelope.get('ok') is not True or rc != 0:
++            return 'unknown'
++        if status not in ('delivered', 'queued', 'partial', 'unknown', 'failed'):
++            return 'unknown'
++        if status == 'delivered' and (d.get('delivered') is not True or d.get('queued') is True):
++            return 'unknown'
++        if status == 'queued' and (d.get('queued') is not True or d.get('delivered') is True):
++            return 'unknown'
++        if status in ('partial', 'unknown') and (d.get('delivered') is True or d.get('queued') is True):
++            return 'unknown'
++        return status
++    if isinstance(d, dict) and d.get('voided') is True:
++        return 'voided'
++    if rc != 0 or envelope.get('ok') is not True:
++        details = envelope.get('error', {}).get('details', {})
++        if (details.get('sentCount', 0) or details.get('delivered') is True or details.get('deliveredClientIds')):
++            return 'unknown'
++        return 'failed'
++    if not isinstance(d, dict):
++        return 'unknown'
++    if d.get('queued') is True:
++        return 'queued'
++    count, sent = d.get('chunkCount'), d.get('sent')
++    return 'delivered' if type(count) is int and count >= 1 and isinstance(sent, list) and len(sent) == count else 'unknown'
++
++if __name__ == '__main__':
++    try:
++        with open(sys.argv[1], encoding='utf-8') as f:
++            result = classify(json.load(f), int(sys.argv[2]) if len(sys.argv) > 2 else 0)
++    except (OSError, ValueError, TypeError, AttributeError, IndexError):
++        result = 'unknown'
++    print(result)
+--- a/src/cli/commands/queue.js
++++ b/src/cli/commands/queue.js
+@@ -1,3 +1,4 @@
++import { segmentedReports, acknowledgeSegmentReports } from "../../core/segmented-send.js";
+ import { parseCliArgs } from "../../config/load-config.js";
+ import { WxbError, cliSuccess } from "../../core/errors.js";
+ import { resolveFetchAccount } from "../../core/fetch-messages.js";
+@@ -8,10 +9,12 @@
+   const [subcommand = "list", ...rest] = argv;
+   const flags = parseCliArgs(rest);
+   // Maintenance needs only a local account ID, never login/network credentials.
+-  if (["prune", "void", "reports", "ack", "snapshot", "expire-outbox"].includes(subcommand)) {
++  if (["prune", "void", "reports", "ack", "snapshot", "expire-outbox", "send-reports", "send-report-ack"].includes(subcommand)) {
+     if (typeof flags.account !== "string") throw new TypeError("Maintenance requires --account");
+     const state = context.config.stateDir;
+     const id = flags.account;
++    if (subcommand === "send-report-ack") return cliSuccess(await acknowledgeSegmentReports(state, id, JSON.parse(flags.ids)));
++    if (subcommand === "send-reports") return cliSuccess(await segmentedReports(state, id));
+     if (subcommand === "snapshot") return cliSuccess(await queueSnapshot(state, id));
+     if (subcommand === "expire-outbox") return cliSuccess(await expireOutbox(state, id, flags.file));
+     if (subcommand === "prune") return cliSuccess(await pruneDeliveryQueue(state, id));
+--- a/src/cli/commands/send.js
++++ b/src/cli/commands/send.js
+@@ -99,6 +99,7 @@
+     userId,
+     alias,
+     text,
++    deliveryId: typeof flags.deliveryId === "string" ? flags.deliveryId : undefined,
+     config: context.config,
+     timeoutMs: optionalNumber(flags.timeout) ?? context.config.fetchTimeoutMs,
+     client: context.client,
+--- a/src/core/delivery-queue.js
++++ b/src/core/delivery-queue.js
+@@ -1,3 +1,4 @@
++import { segmentedSession } from "./segmented-send.js";
+ import { WxbError } from "./errors.js";
+ import { chunkText } from "./chunk-text.js";
+ import { generateClientId } from "./ilink-client.js";
+@@ -31,6 +32,7 @@
+     userId,
+     text,
+     source = "send",
++    deliveryId,
+     error,
+     maxItems,
+     lock
+@@ -50,6 +52,7 @@
+     userId,
+     text,
+     source,
++    ...(deliveryId ? { deliveryId } : {}),
+     lastError: error
+       ? {
+         code: error.code ?? "UNKNOWN_ERROR",
+@@ -120,6 +123,14 @@
+     maxChunkChars: config.maxChunkChars,
+     maxMessages: config.maxDeliveryMessages
+   });
++  const segmented = await segmentedSession({ stateDir, account, userId: item.userId,
++    text: item.text, chunks, deliveryId: item.deliveryId });
++  if (segmented) {
++    const result = segmented.result ?? await segmented.send({ client, contextToken, timeoutMs });
++    if (result.delivered) await removeQueuedDelivery(stateDir, account.accountId, item.id, { lock: false });
++    return { ...result, status: result.delivered ? "sent" : result.deliveryStatus,
++      userId: item.userId, queueId: item.id };
++  }
+   const sent = [];
+   const startedAt = Math.floor(Date.now() / 1000);
+ 
+--- /dev/null
++++ b/src/core/segmented-send.js
+@@ -0,0 +1,165 @@
++import { createHash } from "node:crypto";
++import { open, stat } from "node:fs/promises";
++import path from "node:path";
++import { accountStatePath } from "../state/state-dir.js";
++import { readJsonFile, writeJsonAtomic } from "../state/json-file.js";
++import { withAccountLock } from "../state/lock.js";
++import { appendMessageHistory } from "../state/message-history.js";
++import { generateClientId } from "./ilink-client.js";
++import { WxbError } from "./errors.js";
++
++const hash = text => createHash("sha256").update(text).digest("hex");
++export const segmentedFile = (state, account) => accountStatePath(state, account, ".segmented-send.ledger");
++export async function segmentedEnabled(state) {
++  try { return (await stat(path.join(state, "segmented-retry.enabled"))).isFile(); }
++  catch (e) { if (e.code === "ENOENT") return false; throw e; }
++}
++
++// All journal operations, including reports, run under the existing account lock.
++async function readJournal(state, account) {
++  const doc = await readJsonFile(segmentedFile(state, account), { version: 1, items: {} });
++  if (doc?.version !== 1 || !doc.items || typeof doc.items !== "object" || Array.isArray(doc.items) ||
++      !Object.values(doc.items).every(r => r && typeof r.userId === "string" &&
++        typeof r.textHash === "string" && Array.isArray(r.chunks) && r.chunks.length > 0 &&
++        r.chunks.every(c => typeof c.text === "string" && typeof c.clientId === "string" &&
++          ["pending", "inflight", "confirmed"].includes(c.state)) &&
++        ["active", "unknown", "delivered"].includes(r.state) &&
++        hash(r.chunks.map(c => c.text).join("")) === r.textHash &&
++        (r.state !== "delivered" || r.chunks.every(c => c.state === "confirmed")))) {
++    throw new WxbError("SEGMENTED_JOURNAL_INVALID", "Segment journal unreadable; manual review required.");
++  }
++  return doc;
++}
++async function persist(state, account, doc) {
++  const file = segmentedFile(state, account);
++  await writeJsonAtomic(file, doc);
++  const dir = await open(path.dirname(file), "r");
++  try { await dir.sync(); } finally { await dir.close(); }
++}
++function view(id, r, reason = r.reason, enabled = true) {
++  const confirmedChunks = [], unknownChunks = [], pendingChunks = [];
++  r.chunks.forEach((c, i) => (c.state === "confirmed" ? confirmedChunks :
++    c.state === "inflight" ? unknownChunks : pendingChunks).push(i + 1));
++  const deliveryStatus = !enabled && r.state === "active" && !confirmedChunks.length ? "unknown" : r.state === "delivered" ? "delivered" :
++    r.state === "unknown" || unknownChunks.length ? "unknown" :
++      confirmedChunks.length ? "partial" : "queued";
++  return { deliveryStatus, delivered: deliveryStatus === "delivered", queued: deliveryStatus === "queued",
++    deliveryId: id, toUserId: r.userId, textHash: r.textHash, chunkCount: r.chunks.length,
++    confirmedChunks, unknownChunks, pendingChunks,
++    sent: r.chunks.flatMap((c, i) => c.state === "confirmed" ?
++      [{ clientId: c.clientId, chunkIndex: i + 1, chars: c.text.length }] : []),
++    ...(!enabled && r.state === "active" ? { retryPaused: true, reason: "SEGMENTED_RETRY_DISABLED" } : {}),
++    ...(r.reportedAt ? { reportAcknowledged: true } : {}),
++    ...(reason ? { reason } : {}), requiresConfirmation: deliveryStatus === "unknown" };
++}
++
++// No server idempotency is assumed. Only explicit protocol rejection proves
++// non-delivery; network/timeout/5xx/invalid JSON and arbitrary errors are unknown.
++const rejected = e => e instanceof WxbError &&
++  ["INVALID_CONTEXT_TOKEN", "SESSION_EXPIRED", "AUTH_FAILED"].includes(e.code);
++
++export async function segmentedSession({ stateDir, account, userId, text, chunks, deliveryId }) {
++  const enabled = await segmentedEnabled(stateDir);
++  const doc = await readJournal(stateDir, account.accountId);
++  const id = hash(`${userId}\0${deliveryId ?? text}`);
++  let r = doc.items[id];
++  if (r && (r.userId !== userId || r.textHash !== hash(text))) {
++    throw new WxbError("DELIVERY_ID_CONFLICT", "Delivery ID belongs to different content.");
++  }
++  if (!enabled && !r) return null; // exact legacy path for unenrolled messages
++  const response = (reason) => ({ accountId: account.accountId, ...view(id, r, reason, enabled) });
++  if (r && (r.state !== "active" || r.chunks.some(c => c.state === "inflight"))) {
++    return { result: response() }; // includes interrupted in-flight write-ahead
++  }
++  // Disabling never hands an enrolled partial message back to whole-text retry.
++  if (!enabled && r) return { result: { ...response("SEGMENTED_RETRY_DISABLED"), retryPaused: true } };
++  if (!r) {
++    r = { userId, textHash: hash(text), createdAt: new Date().toISOString(), state: "active",
++      chunks: chunks.map(text => ({ text, clientId: generateClientId(), state: "pending" })) };
++    doc.items[id] = r;
++  }
++  return {
++    async send({ client, contextToken, timeoutMs }) {
++      for (let i = 0; i < r.chunks.length; i++) {
++        const c = r.chunks[i];
++        if (c.state === "confirmed") continue;
++        c.state = "inflight";
++        // Failure here means NO send begins. A possibly committed marker is
++        // deliberately left in-flight for conservative recovery.
++        try { await persist(stateDir, account.accountId, doc); }
++        catch { return { ...response("PROGRESS_WRITE_FAILED_BEFORE_SEND"), deliveryStatus: "unknown",
++          delivered: false, queued: false, requiresConfirmation: true }; }
++        try {
++          await client.sendTextMessage({ token: account.token, toUserId: userId,
++            text: c.text, contextToken, clientId: c.clientId, timeoutMs });
++        } catch (e) {
++          if (rejected(e)) { c.state = "pending"; r.reason = e.code; }
++          else { r.state = "unknown"; r.reason = "SEND_RESPONSE_UNKNOWN"; }
++          try { await persist(stateDir, account.accountId, doc); }
++          catch { c.state = "inflight"; r.state = "unknown"; r.reason = "PROGRESS_WRITE_FAILED"; }
++          return response();
++        }
++        try {
++          await appendMessageHistory(stateDir, account.accountId, { id: c.clientId,
++            direction: "outgoing", fromUserId: account.ownerUserId, toUserId: userId,
++            timestamp: Math.floor(Date.now() / 1000), type: "text", text: c.text,
++            contextToken, chunkIndex: i + 1, chunkCount: r.chunks.length, segmentedDeliveryId: id });
++        } catch {
++          r.state = "unknown"; r.reason = "OUTGOING_HISTORY_WRITE_FAILED";
++          try { await persist(stateDir, account.accountId, doc); } catch { /* durable in-flight marker remains */ }
++          return response();
++        }
++        c.state = "confirmed";
++        if (r.chunks.every(c => c.state === "confirmed")) r.state = "delivered";
++        delete r.reason;
++        try { await persist(stateDir, account.accountId, doc); }
++        catch {
++          c.state = "inflight"; r.state = "unknown"; r.reason = "PROGRESS_WRITE_FAILED_AFTER_SEND";
++          try { await persist(stateDir, account.accountId, doc); } catch { /* keep earlier write-ahead */ }
++          return response();
++        }
++      }
++      return response();
++    }
++  };
++}
++
++export async function segmentedReports(stateDir, accountId) {
++  return withAccountLock(stateDir, accountId, async () => {
++    const doc = await readJournal(stateDir, accountId);
++    const enabled = await segmentedEnabled(stateDir);
++    return { items: Object.entries(doc.items).flatMap(([id, r]) => {
++      const item = view(id, r, undefined, enabled);
++      return item.deliveryStatus === "unknown" && !r.reportedAt
++        ? [{ accountId, ...item }] : [];
++    }), reportProtocol: "仅在主对话报告 deliveryId、textHash 与 confirmedChunks/unknownChunks/pendingChunks；待确认项禁止全文重发、禁止写入 outbox。实际报告后调用 queue send-report-ack --account <accountId> --ids <已报告 deliveryId 的 JSON 数组>。只确认报告事实，不解除发送暂停。未报告不得 ack。人工核对后另行决定。" };
++  });
++}
++
++export async function acknowledgeSegmentReports(stateDir, accountId, ids) {
++  if (!Array.isArray(ids) || !ids.every(id => typeof id === "string" && /^[a-f0-9]{64}$/.test(id))) {
++    throw new TypeError("Expected segment delivery IDs");
++  }
++  return withAccountLock(stateDir, accountId, async () => {
++    const doc = await readJournal(stateDir, accountId);
++    const enabled = await segmentedEnabled(stateDir);
++    for (const id of ids) {
++      const r = doc.items[id];
++      if (!r || view(id, r, undefined, enabled).deliveryStatus !== "unknown") throw new TypeError("Not a paused delivery");
++      r.reportedAt = new Date().toISOString();
++    }
++    await persist(stateDir, accountId, doc);
++    return { acknowledged: ids.length, retryPaused: true };
++  });
++}
++
++// Snapshot decoration only: it does not change queue/void/expiry semantics.
++export async function segmentedQueueProgress(stateDir, accountId, items) {
++  const doc = await readJournal(stateDir, accountId);
++  const enabled = await segmentedEnabled(stateDir);
++  return items.map(item => {
++    const id = hash(`${item.userId}\0${item.deliveryId ?? item.text}`);
++    const r = doc.items[id];
++    return r ? { ...item, segmented: view(id, r, undefined, enabled) } : item;
++  });
++}
+--- a/src/core/send-text.js
++++ b/src/core/send-text.js
+@@ -1,3 +1,4 @@
++import { segmentedSession } from "./segmented-send.js";
+ import { WxbError } from "./errors.js";
+ import { generateClientId, IlinkClient } from "./ilink-client.js";
+ import { chunkText } from "./chunk-text.js";
+@@ -114,6 +115,9 @@
+     if (isVoided(queue, { userId: targetUserId, text })) {
+       return { accountId: account.accountId, toUserId: targetUserId, delivered: false, queued: false, voided: true };
+     }
++    const segmented = await segmentedSession({ stateDir, account, userId: targetUserId,
++      text, chunks, deliveryId: options.deliveryId });
++    if (segmented?.result) return segmented.result;
+     const contextToken = await resolveContextToken(stateDir, account.accountId, targetUserId);
+     if (!contextToken) {
+       if (queueOnNoContext) {
+@@ -122,6 +126,7 @@
+           accountId: account.accountId,
+           userId: targetUserId,
+           text,
++          deliveryId: options.deliveryId,
+           source: "no_context",
+           maxItems: config.delayedQueueMaxItems,
+           lock: false
+@@ -132,7 +137,8 @@
+           toUserId: targetUserId,
+           delivered: false,
+           queued: true,
+-          queue: queued
++          queue: queued,
++          ...(segmented ? { deliveryStatus: "queued" } : {})
+         };
+       }
+ 
+@@ -155,6 +161,17 @@
+       contextToken,
+       timeoutMs
+     }, async (activeContextToken) => {
++      if (segmented) {
++        const result = await segmented.send({ client, contextToken: activeContextToken, timeoutMs });
++        if (result.deliveryStatus === "queued") {
++          if (!queueOnInvalidContext) return { ...result, deliveryStatus: "failed", queued: false };
++          const queued = await queueTextDelivery({ stateDir, accountId: account.accountId,
++            userId: targetUserId, text, deliveryId: options.deliveryId, source: "segmented_rejection",
++            maxItems: config.delayedQueueMaxItems, lock: false });
++          return { ...result, queue: queued };
++        }
++        return result;
++      }
+       const sent = [];
+       const startedAt = Math.floor(Date.now() / 1000);
+ 
+--- a/src/mcp/tools.js
++++ b/src/mcp/tools.js
+@@ -212,7 +212,7 @@
+   },
+   {
+     name: "sendText",
+-    description: "Send a text reply to a previously seen WeChat user through cached bridge routing state.",
++    description: "Send text. When segmented retry is enabled, inspect deliveryStatus: delivered / queued / partial / unknown. Unknown requires manual review; never resend the full text.",
+     inputSchema: {
+       type: "object",
+       additionalProperties: false,
+@@ -226,6 +226,7 @@
+           type: "string",
+           description: "Optional local alias for a previously seen user."
+         },
++        deliveryId: { type: "string", description: "Stable logical reply ID; reuse on retry, change for independent identical text." },
+         text: {
+           type: "string",
+           minLength: 1,
+@@ -367,6 +368,7 @@
+       userId: optionalString(args, "userId"),
+       alias: optionalString(args, "alias"),
+       text: requiredString(args, "text"),
++      deliveryId: optionalString(args, "deliveryId"),
+       timeoutMs: optionalNumber(args, "timeoutMs", { min: 1 }) ?? config.fetchTimeoutMs,
+       client: context.client,
+       queueOnInvalidContext: optionalBoolean(args, "queueOnInvalidContext", true),
+--- a/src/state/delivery-queue-store.js
++++ b/src/state/delivery-queue-store.js
+@@ -1,3 +1,4 @@
++import { segmentedQueueProgress } from "../core/segmented-send.js";
+ import { readFacts, writeFacts, observeQueueError, resetQueueError, recordOutboxExpiry } from "./delivery-facts-store.js";
+ import { createHash, randomBytes } from "node:crypto";
+ import { readFile } from "node:fs/promises";
+@@ -185,7 +186,10 @@
+ 
+ export async function queueSnapshot(stateDir, accountId) {
+   return withAccountLock(stateDir, accountId, async () => {
+-    try { return { ...await readQueueDocument(stateDir, accountId), queue_error: false }; }
++    try {
++      const doc = await readQueueDocument(stateDir, accountId);
++      return { ...doc, items: await segmentedQueueProgress(stateDir, accountId, doc.items), queue_error: false };
++    }
+     catch {
+       await observeQueueError(stateDir, accountId, deliveryQueueFilePath(stateDir, accountId));
+       return { items: [], queue_error: true };
+@@ -207,6 +211,7 @@
+     createdAt: delivery.createdAt ?? new Date().toISOString(),
+     attempts: delivery.attempts ?? 0,
+     source: delivery.source ?? "send",
++    ...(delivery.deliveryId ? { deliveryId: delivery.deliveryId } : {}),
+     ...(delivery.lastAttemptAt ? { lastAttemptAt: delivery.lastAttemptAt } : {}),
+     ...(delivery.lastError ? { lastError: delivery.lastError } : {})
+   };
+--- /dev/null
++++ b/test/unit/segmented-send.test.js
+@@ -0,0 +1,122 @@
++import assert from 'node:assert/strict';
++import fs from 'node:fs/promises';
++import { syncBuiltinESMExports } from 'node:module';
++import os from 'node:os';
++import path from 'node:path';
++import test, { mock } from 'node:test';
++import { sendText } from '../../src/core/send-text.js';
++import { WxbError } from '../../src/core/errors.js';
++import { saveAccount } from '../../src/state/account-store.js';
++import { rememberContextToken } from '../../src/state/context-token-store.js';
++import { messageHistoryFilePath } from '../../src/state/message-history.js';
++import { readDeliveryQueue, queueSnapshot, voidDeliveries } from '../../src/state/delivery-queue-store.js';
++import { queueTextDelivery, flushOneQueuedDeliveryForUser } from '../../src/core/delivery-queue.js';
++import { segmentedFile, segmentedReports, acknowledgeSegmentReports } from '../../src/core/segmented-send.js';
++import { runSendCommand } from '../../src/cli/commands/send.js';
++import { callMcpTool } from '../../src/mcp/tools.js';
++import { stageHandoff, acknowledgeHandoff, readHandoff } from '../../src/state/inbound-handoff-store.js';
++import { receiveInbound, completeInbound } from '../../src/core/inbound-receiver.js';
++const account={accountId:'fixture_bot',ownerUserId:'fixture_owner',token:'synthetic-only',baseUrl:'https://mock.invalid'};
++const userId='fixture_owner',text='Hello world. Next.',config={maxChunkChars:13,minChunkChars:5,maxDeliveryMessages:10};
++async function fixture(fn,enabled=true){
++ const stateDir=await fs.mkdtemp(path.join(os.tmpdir(),'wx-segments-'));
++ try{await saveAccount(stateDir,account);await rememberContextToken(stateDir,account.accountId,userId,'synthetic-route');
++ if(enabled)await fs.writeFile(path.join(stateDir,'segmented-retry.enabled'),'');
++ await fn({stateDir,accountId:account.accountId,userId,text,config});
++ }finally{await fs.rm(stateDir,{recursive:true,force:true});}
++}
++function client(failAt=0,error=new WxbError('INVALID_CONTEXT_TOKEN','synthetic rejection')){
++ const calls=[];return{calls,async sendTextMessage(req){calls.push(req);if(calls.length===failAt)throw error;return{ret:0};}};
++}
++test('segment 2 rejection resumes at segment 2; segment 1 never repeats',async()=>fixture(async o=>{
++ const a=client(2),r=await sendText({...o,client:a});assert.equal(r.deliveryStatus,'partial');assert.deepEqual(r.confirmedChunks,[1]);
++ const b=client(),done=await sendText({...o,client:b});assert.equal(done.deliveryStatus,'delivered');assert.equal(b.calls.length,1);
++ assert.equal(b.calls[0].text,a.calls[1].text);assert.equal(b.calls[0].clientId,a.calls[1].clientId);
++ await sendText({...o,client:b});assert.equal(b.calls.length,1);
++}));
++test('queued deliveries share persisted segmented engine and snapshot progress',async()=>fixture(async o=>{
++ await queueTextDelivery(o);const a=client(2),opts={...o,account,contextToken:'synthetic-route'};
++ assert.equal((await flushOneQueuedDeliveryForUser({...opts,client:a})).deliveryStatus,'partial');
++ assert.deepEqual((await queueSnapshot(o.stateDir,account.accountId)).items[0].segmented.confirmedChunks,[1]);
++ const b=client();assert.equal((await flushOneQueuedDeliveryForUser({...opts,client:b})).deliveryStatus,'delivered');
++ assert.equal(b.calls.length,1);assert.equal((await readDeliveryQueue(o.stateDir,account.accountId)).length,0);
++}));
++test('history failure after success pauses unknown and never resends',async()=>fixture(async o=>{
++ await fs.mkdir(messageHistoryFilePath(o.stateDir,account.accountId));const c=client(),r=await sendText({...o,client:c});
++ assert.equal(r.deliveryStatus,'unknown');assert.deepEqual(r.unknownChunks,[1]);assert.equal(r.reason,'OUTGOING_HISTORY_WRITE_FAILED');
++ await sendText({...o,client:c});assert.equal(c.calls.length,1);
++ const report=(await segmentedReports(o.stateDir,account.accountId)).items[0];assert.equal(report.deliveryId,r.deliveryId);
++ assert.deepEqual(report.pendingChunks,[2]);assert.equal(JSON.stringify(report).includes('synthetic-route'),false);
++}));
++for(const error of[new WxbError('NETWORK_ERROR','lost'),new WxbError('SERVER_ERROR','5xx'),new Error('aborted')]){
++ test(`ambiguous ${error.code??'error'} stops automatic retry`,async()=>fixture(async o=>{
++ const c=client(2,error),r=await sendText({...o,client:c});assert.equal(r.deliveryStatus,'unknown');
++ assert.deepEqual(r.confirmedChunks,[1]);assert.deepEqual(r.unknownChunks,[2]);await sendText({...o,client:c});assert.equal(c.calls.length,2);
++ }));
++}
++test('progress commit failure leaves durable in-flight fence even if fallback write also fails',async()=>fixture(async o=>{
++ const rename=fs.rename;let commits=0;
++ const patch=mock.method(fs,'rename',async(a,b)=>{if(b===segmentedFile(o.stateDir,account.accountId)&&++commits>=2)throw new Error('disk failure');return rename(a,b);});syncBuiltinESMExports();
++ const c=client();let r;try{r=await sendText({...o,client:c});}finally{patch.mock.restore();syncBuiltinESMExports();}
++ assert.equal(r.deliveryStatus,'unknown');assert.equal(r.reason,'PROGRESS_WRITE_FAILED_AFTER_SEND');
++ const doc=JSON.parse(await fs.readFile(segmentedFile(o.stateDir,account.accountId),'utf8'));assert.equal(Object.values(doc.items)[0].chunks[0].state,'inflight');
++ assert.equal((await sendText({...o,client:c})).deliveryStatus,'unknown');assert.equal(c.calls.length,1);
++}));
++test('write-ahead failure begins no send',async()=>fixture(async o=>{
++ const rename=fs.rename,patch=mock.method(fs,'rename',async(a,b)=>{if(b===segmentedFile(o.stateDir,account.accountId))throw new Error('disk failure');return rename(a,b);});syncBuiltinESMExports();
++ const c=client();try{assert.equal((await sendText({...o,client:c})).reason,'PROGRESS_WRITE_FAILED_BEFORE_SEND');assert.equal(c.calls.length,0);}
++ finally{patch.mock.restore();syncBuiltinESMExports();}
++}));
++test('crash image before local accounting recovers as unknown',async()=>fixture(async o=>{
++ const c=client(1,new Error('exit')),r=await sendText({...o,client:c});
++ const file=segmentedFile(o.stateDir,account.accountId),doc=JSON.parse(await fs.readFile(file,'utf8'));Object.values(doc.items)[0].state='active';
++ await fs.writeFile(file,JSON.stringify(doc));const b=client();assert.equal((await sendText({...o,client:b})).deliveryStatus,'unknown');assert.equal(b.calls.length,0);
++ assert.equal((await segmentedReports(o.stateDir,account.accountId)).items[0].deliveryId,r.deliveryId);
++}));
++test('switch off preserves legacy result shape and full-text retry',async()=>fixture(async o=>{
++ await assert.rejects(sendText({...o,client:client(2)}),e=>e.details.sentCount===1);
++ const b=client(),r=await sendText({...o,client:b});assert.deepEqual(Object.keys(r).sort(),['accountId','toUserId','chunkCount','sent'].sort());assert.equal(b.calls.length,2);
++ await assert.rejects(fs.stat(segmentedFile(o.stateDir,account.accountId)),e=>e.code==='ENOENT');
++},false));
++test('disable after enrollment pauses partial without whole-text retry',async()=>fixture(async o=>{
++ await sendText({...o,client:client(2)});await fs.rm(path.join(o.stateDir,'segmented-retry.enabled'));
++ const b=client(),r=await sendText({...o,client:b});assert.equal(r.retryPaused,true);assert.equal(r.deliveryStatus,'partial');assert.equal(b.calls.length,0);
++}));
++test('CLI/MCP expose all four states and stable logical IDs',async()=>fixture(async o=>{
++ const context={config:{...config,stateDir:o.stateDir},client:client()};
++ const cli=await runSendCommand(['--user',userId,'--text',text,'--delivery-id','reply:m1'],context);
++ const mcp=JSON.parse((await callMcpTool('sendText',{userId,text,deliveryId:'reply:m1'},context)).content[0].text);
++ assert.equal(cli.data.deliveryStatus,'delivered');assert.equal(mcp.data.deliveryStatus,'delivered');assert.equal(cli.data.deliveryId,mcp.data.deliveryId);assert.equal(context.client.calls.length,2);
++ await runSendCommand(['--user',userId,'--text',text,'--delivery-id','reply:m2'],context);assert.equal(context.client.calls.length,4);
++ const partial=JSON.parse((await callMcpTool('sendText',{userId,text,deliveryId:'reply:m3'},{...context,client:client(2)})).content[0].text);assert.equal(partial.data.deliveryStatus,'partial');
++ const unknown=await runSendCommand(['--user',userId,'--text',text,'--delivery-id','reply:m4'],{...context,client:client(1,new Error('lost'))});assert.equal(unknown.data.deliveryStatus,'unknown');
++ const queued=await runSendCommand(['--user',userId,'--text','queue','--delivery-id','reply:m5'],{...context,client:client(1)});assert.equal(queued.data.deliveryStatus,'queued');assert.equal(queued.data.queued,true);
++}));
++for(const deferAck of[false,true]){
++ test(`consumer reply leaves inbound ledger unchanged (deferAck=${deferAck})`,async()=>fixture(async o=>{
++ const m={id:'m1',fromUserId:userId,text:'input',type:'text'};await stageHandoff(o.stateDir,account.accountId,[m]);
++ if(deferAck)await receiveInbound({...o,ownerUserId:userId,ids:['m1']});else await acknowledgeHandoff(o.stateDir,account.accountId,['m1']);
++ const before=await readHandoff(o.stateDir,account.accountId);await sendText({...o,client:client(2)});await sendText({...o,client:client()});
++ assert.deepEqual(await readHandoff(o.stateDir,account.accountId),before);
++ if(deferAck){await completeInbound({...o,ownerUserId:userId,ids:['m1']});assert.deepEqual((await readHandoff(o.stateDir,account.accountId)).receiver.processedIds,['m1']);}
++ }));
++}
++test('existing voids block enrolled retry',async()=>fixture(async o=>{
++ const r=await sendText({...o,client:client(2)});await voidDeliveries(o.stateDir,account.accountId,{items:[{id:'fixture-void',userId,textHash:r.textHash}]});
++ const c=client();assert.equal((await sendText({...o,client:c})).voided,true);assert.equal(c.calls.length,0);
++}));
++
++test('acknowledging a factual report never clears the sending fence',async()=>fixture(async o=>{
++ const c=client(1,new Error('lost')),r=await sendText({...o,client:c});
++ await acknowledgeSegmentReports(o.stateDir,account.accountId,[r.deliveryId]);
++ assert.deepEqual((await segmentedReports(o.stateDir,account.accountId)).items,[]);
++ assert.equal((await sendText({...o,client:c})).deliveryStatus,'unknown');assert.equal(c.calls.length,1);
++}));
++
++test('disable keeps definitely unsent enrolled queue parked instead of handing it to legacy retry',async()=>fixture(async o=>{
++ await sendText({...o,client:client(1)});await fs.rm(path.join(o.stateDir,'segmented-retry.enabled'));
++ const c=client(),r=await flushOneQueuedDeliveryForUser({...o,account,contextToken:'synthetic-route',client:c});
++ assert.equal(r.deliveryStatus,'unknown');assert.equal(r.queued,false);assert.equal(c.calls.length,0);
++ assert.equal((await readDeliveryQueue(o.stateDir,account.accountId)).length,1);
++ assert.equal((await queueSnapshot(o.stateDir,account.accountId)).items[0].segmented.deliveryStatus,'unknown');
++}));
