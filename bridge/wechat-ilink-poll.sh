@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Muse-Codex-微信互通系统
 set -euo pipefail
 umask 077
 if [[ "${1:-}" != --backup-recover && "${1:-}" != --backup-keepalive && "${1:-}" != --backup-probe && "${1:-}" != --keepalive-worker ]]; then
