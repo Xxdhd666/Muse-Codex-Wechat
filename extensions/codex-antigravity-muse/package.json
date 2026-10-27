@@ -1,0 +1,46 @@
+{
+  "name": "quota-float",
+  "version": "4.0.0",
+  "description": "桌面 AI 额度悬浮球",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "check": "node --check main.js && node --check preload.js && node --check scanner.js && node --check antigravity.js && node --check codex-live.js && node --check codex-api.js && node --check renderer/app.js && node --check renderer/ball.js",
+    "pack": "electron-builder --win dir --x64"
+  },
+  "devDependencies": {
+    "electron": "^33.2.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "local.quotafloat.app",
+    "productName": "QuotaFloat",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "scanner.js",
+      "antigravity.js",
+      "codex-live.js",
+      "seed.json",
+      "renderer/**",
+      "assets/**",
+      "codex-api.js"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "signAndEditExecutable": false,
+      "icon": "assets/icon.png"
+    }
+  }
+}

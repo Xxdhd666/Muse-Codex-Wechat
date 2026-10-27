@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'">
+<title>额度仪表盘</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="dash">
+<section id="panel" class="panel">
+  <header class="panel-head" id="panel-head">
+    <nav class="tabs" role="tablist">
+      <button class="tab active" role="tab" data-tab="detail">详情</button>
+      <button class="tab" role="tab" data-tab="select">悬浮球显示</button>
+      <button class="tab" role="tab" data-tab="usage">仪表盘</button>
+    </nav>
+    <button id="refresh-btn" class="pill-btn refresh" type="button">刷新数据</button>
+    <button id="open-settings" class="pill-btn" type="button">设置</button>
+  </header>
+  <div class="panel-body">
+    <div id="view-detail" class="view"></div>
+    <div id="view-select" class="view" hidden></div>
+    <div id="view-usage" class="view" hidden></div>
+    <div id="view-settings" class="view" hidden></div>
+  </div>
+  <footer id="panel-foot" class="panel-foot"></footer>
+</section>
+<script src="app.js"></script>
+</body>
+</html>

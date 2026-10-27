@@ -106,3 +106,12 @@
 1. 核对基线哈希 → 隔离打补丁 → 校验
 2. 先装桥接文件，再装轮询脚本、hook 定义（原子替换）
 3. 开关保持关闭，观察若干轮 → 单开第 2 件观察 → 单开第 3 件观察 → 真实消息验收
+
+## 拓展功能：Codex-Antigravity-Muse 额度悬浮球
+
+见 `extensions/codex-antigravity-muse/`。
+
+一个 Windows 桌面悬浮球，把 Codex Plus、Antigravity（Gemini / Claude / Argon）
+的剩余额度放在一个球里看，适合同时用 Muse、Codex、Antigravity 的人。
+Codex 走 `codex app-server` 实时查询，Antigravity 走本机 `agy /usage` 自动采集，
+不手动填数、不读登录文件。打包方法与使用说明见该目录下的 README。
